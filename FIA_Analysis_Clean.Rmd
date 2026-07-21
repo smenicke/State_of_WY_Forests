@@ -1,0 +1,1513 @@
+---
+title: "FIA_Analysis_Clean"
+author: "Sam Menicke"
+date: "2026-04-01"
+output: html_document
+---
+
+#Libraries
+
+```{r, warning = FALSE, message = FALSE}
+library(rFIA)
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+library(sf)
+library(USAboundaries)
+library(ggspatial)
+library(scales)
+library(biscale)
+library(cowplot)  
+library(ggalluvial)
+library(ggridges)
+library(ggnewscale)
+library(tibble)
+library(ggpubr)
+library(patchwork)
+library(grid)
+options(tigris_use_cache = TRUE)
+```
+
+#Data
+```{r}
+# Working directory - Update as needed
+fia.dir <- "C:/Users/smenicke/OneDrive - University of Wyoming/2026/Wyo Resilience Project/Analysis/Wyo Forest Resilience"
+# Reading in FIA DB
+db <- readFIA(states = "WY", dir = fia.dir, nCores = 10)
+```
+
+#Boundaries and Grids
+
+```{r}
+# Wyoming Boundary
+wy_bound <- us_states(states = "WY") %>%
+  st_transform(5070)
+
+# Year that defines what is "recent" for statewide estimates
+recent_year <- 2015
+
+# Size for hexes - maps
+hex_km <- 20
+
+# Blank grid of hexes bounded to wy_bound
+hex_grid <- st_make_grid(
+  wy_bound,
+  cellsize = hex_km * 1000,
+  square = FALSE
+) %>%
+  st_intersection(wy_bound)
+
+# Adding information to hexes
+wy_hex <- st_sf(
+  hex_id = seq_len(length(hex_grid)),
+  geometry = hex_grid
+)
+```
+
+------- BLOCK 1: Current Forest Structure. Not looking at remeasured plots, just current estimates of any plot that meets a forested condition (N = 4638) ---------------------------------------------------------
+
+# Figure 1 - Forest Type Map
+
+## Forest Type Labels
+
+```{r}
+# Lookup table for Forest Type
+ft_label_legend <- db$COND %>%
+  select(FORTYPCD) %>%
+  mutate(
+    ft_label = case_when(
+      FORTYPCD == "182" ~ "Rocky Mountain juniper",
+      FORTYPCD == "184" ~ "Juniper woodland",
+      FORTYPCD == "185" ~ "Pinyon/juniper woodland",
+      FORTYPCD == "201" ~ "Douglas fir",
+      FORTYPCD == "221" ~ "Ponderosa pine",
+      FORTYPCD == "265" ~ "Engelmann spruce",
+      FORTYPCD == "266" ~ "Engelmann spruce - Subalpine fir",
+      FORTYPCD == "268" ~ "Subalpine fir",
+      FORTYPCD == "269" ~ "Blue spruce",
+      FORTYPCD == "281" ~ "Lodgepole pine",
+      FORTYPCD == "366" ~ "Limber pine",
+      FORTYPCD == "367" ~ "Whitebark pine",
+      FORTYPCD == "509" ~ "Bur Oak",
+      FORTYPCD == "517" ~ "Elm - Ash - Black locust",
+      FORTYPCD == "520" ~ "Mixed upland hardwoods",
+      FORTYPCD == "703" ~ "Cottonwood",
+      FORTYPCD == "706" ~ "Hackberry - Elm - Green ash",
+      FORTYPCD == "901" ~ "Aspen",
+      FORTYPCD == "962" ~ "Other Hardwoods",
+      FORTYPCD == "999" ~ "Nonstocked",
+      TRUE              ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(ft_label)) %>%
+  distinct(FORTYPCD, ft_label)
+```
+
+## Creating Disturbance Lookup Table and Joining to QMD DF
+
+```{r}
+# Lookup table - If any condition in the plot has a disturbance code > 0 (no observed disturbance) restricted to Measured Years tied to a PLT_CN
+disturbance_interval <- db$COND %>%
+  filter(DSTRBCD1 > 0 | DSTRBCD2 > 0 | DSTRBCD3 > 0) %>%
+  left_join(
+    db$PLOT %>% select(CN, MEASYEAR),
+    by = c("PLT_CN" = "CN")
+  ) %>% 
+  select(PLT_CN, MEASYEAR) %>%
+  distinct() %>%
+  mutate(disturbed = TRUE)
+```
+
+## FIA plots intersected with hex grid
+
+```{r}
+# Filtering database to recent sampling years - So periodic estimate plots aren't included
+db_recent <- db
+
+# Filter PLOT table
+db_recent$PLOT <- db$PLOT %>%
+  filter(MEASYEAR >= recent_year)
+
+# Filter COND table 
+db_recent$COND <- db$COND %>%
+  filter(INVYR >= recent_year)
+
+# Filter TREE table
+db_recent$TREE <- db$TREE %>%
+  filter(INVYR >= recent_year)
+```
+
+
+```{r}
+# Intersecting cleaned db with blank hex grid
+db_hex <- intersectFIA(db_recent, polys = wy_hex)
+```
+
+## Forest Area by Hex
+
+```{r}
+hex_ft <- rFIA::area(
+  db_hex,
+  grpBy = c(hex_id, FORTYPCD),
+  landType = "forest",
+  method = "TI",
+  totals = TRUE
+) %>%
+  #mutate(FORTYPCD = as.character(FORTYPCD)) %>%
+  left_join(ft_label_legend, by = "FORTYPCD") %>%
+  mutate(ft_map = if_else(is.na(ft_label), "Other forest types", ft_label)) %>%
+  group_by(hex_id, ft_map) %>%
+  summarise(AREA_TOTAL = sum(AREA_TOTAL, na.rm = TRUE), .groups = "drop")
+```
+
+## Dominant Forest Type by Hex
+
+```{r}
+# Establishing "dominant" forest type based on area
+dom_all <- hex_ft %>%
+  group_by(hex_id) %>%
+  slice_max(AREA_TOTAL, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Joining to blank hex grid
+map_dom_all <- wy_hex %>%
+  left_join(dom_all, by = "hex_id")
+```
+
+## Plot
+
+```{r}
+# Color pallette
+pal <- c(
+  "Aspen"="#3D2A5A","Douglas fir"="#3B5BA5","Engelmann spruce"="#7AA6FF",
+  "Engelmann spruce - Subalpine fir"="#5AC8E6","Juniper woodland"="#00A9A5",
+  "Lodgepole pine"="#7FD34E","Ponderosa pine"="#F9B000","Rocky Mountain juniper"="#E67E22",
+  "Subalpine fir"="#B24C9E","Whitebark pine"="#9B59B6","Blue Spruce"="#3F8FD2",
+  "Mixed upland hardwoods"="#8C6C4F","Other forest types"="tan"
+)
+
+# Map
+ggplot(map_dom_all) +
+  geom_sf(aes(fill = ft_map), color = NA) +
+  geom_sf(data = st_boundary(wy_bound),
+          color = "grey30", linewidth = 0.4, fill = NA) +
+  scale_fill_manual(values = pal, name = "Dominant forest type") +
+  labs(
+    title = "Dominant forest type across Wyoming",
+    subtitle = "FIA plots (2015-2024) aggregated to 20 km hexagons"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+# Figure 1b - Share of Forest Area by Forest Type
+
+```{r}
+area_ft <- rFIA::area(
+  db,
+  grpBy   = "FORTYPCD"
+)
+
+area_ft_clean <- area_ft %>%
+  filter(YEAR %in% c(2020, 2021, 2022, 2023)) %>%
+  left_join(ft_label_legend, by = "FORTYPCD")
+
+area_ft_filt <- area_ft_clean %>%
+  group_by(ft_label) %>%
+  summarize(ft_total = mean(AREA_TOTAL), .groups = "drop") %>%
+  arrange(desc(ft_total)) %>%
+  filter(!ft_label == "Nonstocked")
+
+dom_ft_clipped <- area_ft_filt[1:10,]
+
+forest_palette <- c(
+  "Lodgepole pine" = "#4C9F70",                  # muted green
+  "Engelmann spruce - Subalpine fir" = "#5B8DB8",# muted blue
+  "Ponderosa pine" = "#C47A3D",                  # muted orange-brown
+  "Douglas fir" = "#8DAA4A",                     # olive
+  "Juniper woodland" = "#7A9A8B",                # sage
+  "Rocky Mountain juniper" = "#9C8C6B",          # tan
+  "Subalpine fir" = "#6E7FA3",                   # steel blue
+  "Aspen" = "#D5B56E",                           # pale gold
+  "Whitebark pine" = "#A4B7A3"                   # very muted green
+)
+
+
+dom_ft_clipped %>%
+  ggplot(aes(
+    x = reorder(ft_label, ft_total),
+    y = ft_total,
+    fill = ft_label
+  )) +
+  geom_col(
+    color = "white",
+    width = 0.7
+  ) +
+  coord_flip() +
+  scale_fill_manual(values = forest_palette) +
+  scale_y_continuous(
+    labels = label_number(scale = 1e-6, suffix = " M"),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = NULL,
+    y = "Forest area (million acres)",
+    title = "Forest area by dominant forest type in Wyoming"
+  ) +
+  guides(fill = "none") +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title.position = "plot"
+  )
+```
+
+
+# Figure 2 - DBH and Basal Area Distributions
+
+## Creating DF
+
+```{r}
+# Finding trees that were recently measured by plot (slice_max function), calculating Basal Area per plot, and joining to Plot Table
+tree_struct <- db_recent$TREE %>%
+  filter(STATUSCD == 1) %>%
+  mutate(
+    ba = pi * (DIA / 24)^2,
+    ba_ac = ba * TPA_UNADJ
+  ) %>%
+  left_join(
+    db$PLOT %>% select(CN, MEASYEAR, PLOT_STATUS_CD),
+    by = c("PLT_CN" = "CN")
+  ) %>%
+  filter(PLOT_STATUS_CD == 1) %>%
+  group_by(PLT_CN) %>%
+  slice_max(MEASYEAR, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Double checking MEASYEAR range
+quantile(tree_struct$MEASYEAR)
+
+# Aggregating Median DBH and total plot Basal Area
+plot_struct <- tree_struct %>%
+  group_by(PLT_CN) %>%
+  summarise(
+    median_dbh = median(DIA, na.rm = TRUE),
+    total_ba   = sum(ba_ac, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Plot
+
+```{r}
+# Median DBH of Recently Measured plots that meet at least one forested condition (n=4638)
+p_dbh <- ggplot(plot_struct, aes(median_dbh)) +
+  geom_histogram(bins = 60, fill = "#4C9F70", color = "white") +
+  labs(
+    title = "Median DBH of forested FIA plots",
+    x = "Median DBH (inches)",
+    y = "Number of plots"
+  ) +
+  coord_cartesian(xlim = c(0, 30)) +
+  theme_minimal(base_size = 12)
+
+# Log-transformed basal area
+p_ba <- ggplot(plot_struct, aes(log(total_ba))) +
+  geom_histogram(bins = 50, fill = "#5B8DB8", color = "white") +
+  labs(
+    title = "Basal area distribution of forested FIA plots",
+    x = "Log-transformed basal area",
+    y = "Number of plots"
+  ) +
+  theme_minimal(base_size = 10)
+
+# Combining panels
+ggarrange(p_dbh, p_ba, ncol = 2, labels = c("A", "B"))
+```
+
+# Figure 3 - Dominant-Cohort Stand Age Map
+
+## Dataframe
+
+```{r}
+# COND table - Forested plots that exhibited a condition proportion of greater than 0
+# PLOT table - CN (Identifier), Measured Year (MEASYEAR), fuzzed LAT/LON
+# "Recently Measured" - slice_max function
+cond_age <- db$COND %>%
+  filter(COND_STATUS_CD == 1, CONDPROP_UNADJ > 0) %>%
+  inner_join(
+    db$PLOT %>% select(CN, MEASYEAR, LAT, LON),
+    by = c("PLT_CN" = "CN")
+  ) %>%
+  filter(MEASYEAR >= 2015) %>%
+  group_by(PLT_CN) %>%
+  slice_max(MEASYEAR, n = 1, with_ties = FALSE) %>%
+  summarise(
+    stdage_aw = sum(STDAGE * CONDPROP_UNADJ, na.rm = TRUE) /
+                sum(CONDPROP_UNADJ, na.rm = TRUE),
+    LAT = first(LAT),
+    LON = first(LON),
+    .groups = "drop"
+  )
+```
+
+## Converting to SF Object
+
+```{r}
+# Converting to a spatial feature
+age_sf <- st_as_sf(
+  cond_age,
+  coords = c("LON", "LAT"),
+  crs = 4326
+) %>%
+  st_transform(5070)
+
+# Joining to blank hex grid
+age_hex <- st_join(wy_hex, age_sf, join = st_intersects)
+
+# Aggregating to Median stand age
+age_hex_summary <- age_hex %>%
+  st_drop_geometry() %>%
+  group_by(hex_id) %>%
+  summarise(
+    dominant_age = median(stdage_aw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Rejoining to hex object, clipping to Wyoming boundary
+age_hex_map <- wy_hex %>%
+  left_join(age_hex_summary, by = "hex_id") %>%
+  st_intersection(wy_bound)
+```
+
+## Plot
+
+```{r}
+ggplot() +
+  geom_sf(data = age_hex_map, aes(fill = dominant_age), color = NA) +
+  geom_sf(data = wy_bound, fill = NA, color = "grey30", linewidth = 0.4) +
+  scale_fill_viridis_c(
+    name = "Stand age (years)",
+    option = "G",
+    breaks = c(0, 100, 200, 300),
+    limits = c(0, 300),
+    na.value = "white"
+  ) +
+  labs(
+    title = "Area-weighted Mean Stand Age across Wyoming",
+    subtitle = "FIA plot means aggregated to 20 km hexagons"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+---------------- BLOCK 2: Structural Dynamics Through Time. Analyzing remeasured, forested plots that are tied to the same PLT_CN (Plot Identifier) with a stable link to the TREE table (N = 495). Reasons for this being the case: A stand-replacing disturbance took out all live trees and the subsequent regeneration does not meet the 1.4 inch DBH threshold for FIA measurement, trees in plot did not meet DBH requirement at t1. ---------------------------------------------------------------------------------------------------------
+
+# Figure 4 - Distribution of QMD Change by Disturbance Occurrence
+
+## DF For Forested, Remeasured Plots
+
+```{r}
+# The plot must be forested at BOTH the previous and current measurements.
+forest_pltcns <- db$COND %>%
+  filter(COND_STATUS_CD == 1) %>%
+  left_join(
+    db$PLOT %>% select(CN, MEASYEAR),
+    by = c("PLT_CN" = "CN")
+  ) %>%
+  select(PLT_CN, MEASYEAR) %>%
+  distinct()
+
+# Lookup table for MEASYEAR_prev
+prev_year_lookup <- db$PLOT %>%
+  select(CN, MEASYEAR) %>%
+  rename(PREV_PLT_CN = CN, MEASYEAR_prev = MEASYEAR)
+
+# Canonical Interval - Plot CN's that match through time and were measured (PLOT_STATUS_CD == 1)
+wy_forest_visits <- db$PLOT %>%
+  filter(PLOT_STATUS_CD == 1, !is.na(PREV_PLT_CN)) %>%
+  semi_join(forest_pltcns, by = c("CN" = "PLT_CN", "MEASYEAR" = "MEASYEAR")) %>% #forested at t2
+  left_join(prev_year_lookup, by = "PREV_PLT_CN") %>%
+  semi_join(forest_pltcns, by = c("PREV_PLT_CN" = "PLT_CN", "MEASYEAR_prev" = "MEASYEAR")) %>% #forested at t1
+  mutate(pltID = paste(UNITCD, STATECD, COUNTYCD, PLOT, sep = "_")) %>%
+  select(
+    PLT_CN = CN,
+    PREV_PLT_CN,
+    pltID,
+    MEASYEAR,
+    MEASYEAR_prev,
+    LAT,
+    LON
+  )
+```
+
+There are 545 plots that were forested at t1 and t2 (at least one condition out of many is forested - PLOT_STATUS_CD == 1).
+
+## Creating QMD DF
+
+```{r}
+# TREE table - QMD for live trees
+qmd_plot <- db$TREE %>%
+  filter(STATUSCD == 1) %>% # live trees only
+  filter(!is.na(DIA)) %>% # filtering out information that would corrupt plot metrics
+  left_join(
+    db$PLOT %>% select(CN, MEASYEAR),
+    by = c("PLT_CN" = "CN")
+  ) %>%
+  group_by(PLT_CN, MEASYEAR) %>%
+  summarise(
+    QMD = sqrt(mean(DIA^2, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Joining with revisited plot lookup table
+wy_visits_qmd <- wy_forest_visits %>%
+  left_join(
+    qmd_plot %>% rename(QMD_t2 = QMD),
+    by = c("PLT_CN" = "PLT_CN")
+  ) %>%
+  left_join(
+    qmd_plot %>% rename(QMD_t1 = QMD),
+    by = c("PREV_PLT_CN" = "PLT_CN")
+  )
+
+# Establishing secure link to the tree table - If no 
+qmd_df <- wy_visits_qmd %>%
+  filter(!is.na(QMD_t1), !is.na(QMD_t2)) %>%
+  mutate(
+    rel_change = (QMD_t2 - QMD_t1) / QMD_t1 * 100,
+    chg_cat = case_when(
+      rel_change >= 10  ~ "Increase",
+      rel_change <= -10 ~ "Decrease",
+      TRUE              ~ "Persistent"
+    ),
+    chg_cat = factor(
+      chg_cat,
+      levels = c("Persistent", "Increase", "Decrease")
+    )
+  )
+```
+
+N = 495, which means 50 remeasured, forested plots at both t1 and t2 had: 0 live trees at either visit (t1 or t2, which is pulled from the TREE table to calculate QMD), or missing records in the TREE table for either timepoint.
+
+## Joining Disturbance Lookup Table to Remeasured Plots
+
+```{r}
+# Joining disturbance lookup table to remeasured, forested plots with stable TREE table links (n=495)
+qmd_df <- qmd_df %>%
+  left_join(disturbance_interval, by = "PLT_CN") %>%
+  mutate(disturbed = if_else(is.na(disturbed), FALSE, disturbed))
+
+# Only disturbed plots (n=101)
+qmd_only_disturb <- qmd_df %>%
+  filter(disturbed)
+```
+
+
+## Plot
+
+```{r}
+ggplot(qmd_df, aes(x = rel_change)) +
+
+  # histogram
+  geom_histogram(
+    aes(y = after_stat(density)),
+    bins = 200,
+    fill = "grey70",
+    color = "white"
+  ) +
+
+  # Smooth overlay
+  geom_density(
+    linewidth = 0.8,
+    color = "black",
+    adjust = 1.2
+  ) +
+
+  # zero reference
+  geom_vline(
+    xintercept = 0,
+    color = "black",
+    linewidth = 0.6
+  ) +
+
+  # ±10% thresholds
+  geom_vline(
+    xintercept = c(-10, 10),
+    linetype = "dashed",
+    color = "#2166ac",
+    linewidth = 0.8
+  ) +
+
+  # persistence band
+  annotate(
+    "rect",
+    xmin = -10, xmax = 10,
+    ymin = -Inf, ymax = Inf,
+    fill = "#2166ac",
+    alpha = 0.05
+  ) +
+
+  # facet by disturbance
+  facet_wrap(
+    ~ disturbed,
+    ncol = 1,
+    labeller = as_labeller(
+      c(
+        "FALSE" = "No recorded disturbance (n = 394)",
+        "TRUE"  = "Recorded disturbance (n = 101)"
+      )
+    )
+  ) +
+
+  # zoom without dropping data
+  coord_cartesian(xlim = c(-50, 50)) +
+
+  labs(
+    title = "Distribution of Quadratic Mean Diameter (QMD) Change",
+    x = "Relative change in QMD (%)",
+    y = "Density of remeasured plots"
+  ) +
+
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Figure 5 - Pre and Post-Disturbance QMD by Disturbance Type
+
+## Creating DF
+
+```{r}
+# Classifying and Aggregating Disturbance Type (there can be multiple per condition) to each plot
+cond_disturb_type <- qmd_only_disturb %>%
+  left_join(
+    db$COND %>% select(PLT_CN, DSTRBCD1),
+    by = "PLT_CN"
+  ) %>%
+  mutate(
+    disturb_type = case_when(
+      DSTRBCD1 %in% c(30, 31, 32) ~ "Fire",
+      DSTRBCD1 %in% c(10, 11, 12) ~ "Insects",
+      DSTRBCD1 %in% c(20, 21, 22) ~ "Disease",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  group_by(PLT_CN) %>%
+  summarise(
+    disturb_type = first(disturb_type),
+    DSTRBCD1 = first(DSTRBCD1),
+    .groups = "drop"
+  )
+
+# Joining to Remeasured, Forested plots that have a stable TREE table linkage
+qmd_disturb_type <- qmd_only_disturb %>%
+  left_join(cond_disturb_type, by = "PLT_CN")
+```
+
+## Plot
+
+```{r}
+ggplot(qmd_disturb_type,
+       aes(x = QMD_t1, y = QMD_t2, color = chg_cat)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", linewidth = 0.8, color = "black") +
+  facet_wrap(~ disturb_type) +
+  scale_color_manual(
+    values = c(
+      "Persistent" = "grey60",
+      "Increase"   = "#2166ac",
+      "Decrease"   = "#b2182b"
+    )
+  ) +
+  labs(
+    title = "Pre- and post-disturbance QMD by disturbance type",
+    caption = "Structural outcome indicates a ± 10% change in QMD",
+    x = "Pre-disturbance QMD",
+    y = "Post-disturbance QMD",
+    color = "Structural outcome"
+  ) +
+  theme_bw()
+```
+
+# Figure 6 - Live Biomass Change by Disturbance Type
+
+## Creating Biomass DF 
+
+```{r}
+# T2 - Current Biomass
+# TREE table - DRYBIO_AG = Aboveground biomass, joined to remeasured plot lookup table
+# COND table - TPA_UNADJ = Trees Per acre, TREE -> PLOT linkage
+          #  - CONDPROP_UNADJ = Condition Proportion per plot, COND -> PLOT stratification constant if entire plot is not forested
+tree_t2 <- db$TREE %>%
+  inner_join(
+    wy_forest_visits %>% select(PLT_CN, pltID, MEASYEAR),
+    by = "PLT_CN"
+  ) %>%
+  left_join(
+    db$COND %>% select(PLT_CN, CONDID, COND_STATUS_CD, CONDPROP_UNADJ),
+    by = c("PLT_CN", "CONDID")
+  ) %>%
+  filter(COND_STATUS_CD == 1) %>%
+  mutate(
+    b_ag_t2 = DRYBIO_AG,
+    w = TPA_UNADJ * CONDPROP_UNADJ
+  )
+
+# Lookup table for T1 - Previous biomass
+t1_lookup <- db$TREE %>%
+  transmute(
+    CN,
+    b_ag_t1 = DRYBIO_AG,
+    STATUSCD_t1 = STATUSCD
+  )
+
+# Linking PREV_TRE_CN (previous TREE ID at T1) to Current TREE CN at T2 - TREE level observations
+tree_t2x <- tree_t2 %>%
+  left_join(t1_lookup, by = c("PREV_TRE_CN" = "CN"))
+
+# Aggregating per plot (T2)
+tree_t2_summary <- tree_t2x %>%
+  group_by(pltID, PLT_CN, MEASYEAR) %>%
+  summarise(
+    B2_live_ag = sum(ifelse(STATUSCD == 1, b_ag_t2 * w, 0), na.rm = TRUE),
+    B2_dead_ag = sum(ifelse(STATUSCD == 2, b_ag_t2 * w, 0), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Aggregating per plot (T1)
+tree_t1_summary <- tree_t2x %>%
+  group_by(pltID, PLT_CN, MEASYEAR) %>%
+  summarise(
+    B1_live_ag = sum(ifelse(STATUSCD_t1 == 1, b_ag_t1 * w, 0), na.rm = TRUE),
+    B1_dead_ag = sum(ifelse(STATUSCD_t1 == 2, b_ag_t1 * w, 0), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# T1 + T2
+pools_both <- wy_forest_visits %>%
+  transmute(PLT_CN, PREV_PLT_CN, pltID, MEASYEAR, MEASYEAR_prev) %>%
+  left_join(tree_t1_summary, by = c("pltID","PLT_CN","MEASYEAR")) %>%
+  left_join(tree_t2_summary, by = c("pltID","PLT_CN","MEASYEAR")) %>%
+  mutate(across(c(B1_live_ag, B1_dead_ag, B2_live_ag, B2_dead_ag),
+                ~ replace_na(.x, 0)))
+```
+
+## Flux Components
+
+```{r}
+# Mortality 
+# Pseudo code: All trees that were alive at T1 (STATUSCD == 1) and are dead at T2 (STATUSCD == 2)
+mortality_by_plot <- tree_t2x %>%
+  filter(!is.na(PREV_TRE_CN), STATUSCD_t1 == 1, STATUSCD == 2) %>%
+  group_by(pltID, PLT_CN, MEASYEAR) %>%
+  summarise(
+    Mort_in_ag = sum(b_ag_t1 * w, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Growth
+# Pseudo code: Biomass that did not exist before (PREV_TRE_CN == NA) but now exists (STATUSCD == 1) subtracted by previously known biomass 
+growth_by_plot <- tree_t2x %>%
+  filter(!is.na(PREV_TRE_CN), STATUSCD == 1) %>%
+  group_by(pltID, PLT_CN, MEASYEAR) %>%
+  summarise(
+    grow_in_ag = sum((b_ag_t2 - b_ag_t1) * w, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Ingrowth
+# Pseudo code: Trees that did not exist before (PREV_TRE_CN == NA) but are now alive (STATUSCD == 1) 
+ingrowth_by_plot <- tree_t2x %>%
+  filter(is.na(PREV_TRE_CN), STATUSCD == 1) %>%
+  group_by(pltID, PLT_CN, MEASYEAR) %>%
+  summarise(
+    ingrowth_in_ag = sum(b_ag_t2 * w, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Joining Fluxes to Pools Dataframe
+pools_both <- pools_both %>%
+  left_join(mortality_by_plot, by = c("pltID","PLT_CN","MEASYEAR")) %>%
+  left_join(growth_by_plot, by = c("pltID","PLT_CN","MEASYEAR")) %>%
+  left_join(ingrowth_by_plot, by = c("pltID","PLT_CN","MEASYEAR")) %>%
+  mutate(across(c(Mort_in_ag, grow_in_ag, ingrowth_in_ag),
+                ~ replace_na(.x, 0)))
+```
+
+## Live Biomass Change
+
+```{r}
+# Survivorship per remeasurement interval
+pools_event <- pools_both %>%
+  mutate(
+    surviv_frac = B2_live_ag / B1_live_ag
+  ) %>%
+  filter(
+    is.finite(surviv_frac),
+    B1_live_ag > 0,
+    surviv_frac <= 3     # visual trim only
+  )
+
+# Joining disturbance type to Pools/Fluxes Dataframe and Classifying Plot Disturbance Agent by Fire/Non-Fire
+pools_event <- pools_event %>%
+  left_join(
+    qmd_disturb_type %>%
+      select(PLT_CN, disturbed, disturb_type),
+    by = "PLT_CN"
+  ) %>%
+  filter(disturbed) %>%
+  mutate(
+    disturbance_class = if_else(
+      disturb_type == "Fire",
+      "Wildfire",
+      "Other disturbance"
+    )
+  )
+```
+
+## Plot
+
+```{r}
+ggplot(
+  pools_event,
+  aes(x = surviv_frac, fill = disturbance_class)
+) +
+  geom_histogram(
+    aes(y = after_stat(count)),
+    binwidth = 0.05,
+    alpha = 0.5,
+    color = "white"
+  ) +
+  geom_density(
+    aes(
+      y = after_stat(count * 0.05),
+      color = disturbance_class
+    ),
+    linewidth = 0.9,
+    fill = NA,
+    show.legend = FALSE
+  ) +
+  geom_vline(aes(xintercept = 1), linetype = "dashed") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_fill_manual(
+    values = c(
+      "Wildfire"          = "#8b0000",
+      "Other disturbance" = "grey60"
+    ),
+    name = NULL
+  ) +
+  scale_color_manual(
+    values = c(
+      "Wildfire"          = "#8b0000",
+      "Other disturbance" = "grey40"
+    )
+  ) +
+  labs(
+    title = "Observed live biomass change following disturbance",
+    subtitle = "Wildfire versus other disturbance agents",
+    x = "Relative live biomass change",
+    y = "Number of plots"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Figure 7 - Sankey Diagram by Disturbance Occurrence
+
+## Sankey Diagram Function
+
+Psuedo code: Time 1: Live and Dead biomass per plot
+            Fluxes of existing growth, mortality, ingrowth
+            Time 2: Changed Live and Dead biomass per plot
+
+```{r}
+plot_flux_sankey_alluvial_clean <- function(
+  sankey_df,
+  use_Mg        = TRUE,
+  units_suffix  = "Mg/ac",
+
+  # ---- label placement ----
+  label_spread_frac = 0.05,
+  label_min_frac    = 0.02,
+  label_min_value   = 5,
+  flow_label_bias_frac = -0.15,
+
+  # ---- pool label styling/placement ----
+  pool_top_margin_frac = 0.03,
+  pool_bottom_margin_frac = 0.03,
+
+  # ---- aesthetics ----
+  show_legend       = TRUE,
+  flow_width        = 0.05,
+  flow_outline_size = 0.55,
+  bar_alpha         = 0.98,
+  bar_width         = 0.07,
+  pool_label_size   = 4.6,
+  flow_label_size   = 4.0,
+  right_label_xshift = 0.07,
+
+  palette_overrides = NULL
+) {
+
+  # ---- core ecological colors ----
+  col_live <- "#2ca02c"
+  col_dead <- "#c62828"
+
+  col_growth_pool   <- "#bdbdbd"  # light gray
+  col_recruit_pool  <- "#7f7f7f"  # darker gray
+
+  lighten <- function(col, alpha = 0.55) scales::alpha(col, alpha)
+
+  row <- sankey_df %>% dplyr::slice(1)
+
+  conv <- if (use_Mg) 1/2204.62262 else 1
+  fmt  <- if (use_Mg) scales::label_number(accuracy = 0.1, big.mark = ",")
+          else         scales::label_number(big.mark = ",")
+
+  clamp0 <- function(x) pmax(as.numeric(x), 0)
+
+  # ---- fluxes ----
+  growth     <- clamp0(row$grow_in_ag)                  * conv
+  ingrowth   <- clamp0(row$ingrowth_in_ag)              * conv
+  mortality  <- clamp0(row$Mort_in_ag)                  * conv
+  survivors  <- clamp0(row$B2_live_ag - row$Mort_in_ag) * conv
+  dead_prev  <- clamp0(row$B1_dead_ag)                  * conv
+  dead_curr  <- clamp0(row$B2_dead_ag)                  * conv
+
+  dead_losses <- clamp0(dead_prev + mortality - dead_curr)
+  dead_retain <- clamp0(min(dead_curr, dead_prev + mortality))
+
+  live_prev <- clamp0(row$B1_live_ag) * conv
+  live_curr <- clamp0(row$B2_live_ag) * conv
+
+  # ---- flows table ----
+  flows <- tibble::tibble(
+    from  = c("Live (prev)", "Live (prev)", "Growth", "Ingrowth",
+              "Dead (prev)", "Dead (prev)"),
+    to    = c("Dead (curr)", "Live (curr)", "Live (curr)", "Live (curr)",
+              "Dead (curr)", "Dead losses"),
+    flux  = c("Mortality", "Survivors", "Growth", "Ingrowth",
+              "Dead retention", "Dead losses"),
+    value = c(mortality, survivors, growth, ingrowth,
+              dead_retain, dead_losses)
+  ) %>%
+    dplyr::filter(value > 0) %>%
+    dplyr::mutate(flow_id = dplyr::row_number())
+
+  flux_levels <- c(
+    "Survivors","Growth","Ingrowth",
+    "Mortality","Dead retention","Dead losses"
+  )
+
+  # ---- alpha as semantic mapping ----
+  flux_alpha <- c(
+    "Survivors"      = 0.60,
+    "Growth"         = 0.50,
+    "Ingrowth"       = 0.50,
+    "Mortality"      = 0.70,
+    "Dead retention" = 0.60,
+    "Dead losses"    = 0.40
+  )
+
+  # ---- long format ----
+  long <- flows %>%
+    tidyr::pivot_longer(c(from, to), names_to = "side",
+                        values_to = "stratum") %>%
+    dplyr::mutate(
+      x = factor(ifelse(side == "from", "Prev", "Curr"),
+                 levels = c("Prev","Curr")),
+      stratum = factor(
+        stratum,
+        levels = c("Live (prev)", "Dead (prev)",
+                   "Growth", "Ingrowth",
+                   "Live (curr)", "Dead (curr)", "Dead losses")
+      ),
+      flux = factor(flux, levels = flux_levels),
+      order_idx = as.numeric(flux),
+
+      pool_grp = dplyr::case_when(
+        stratum %in% c("Live (prev)", "Live (curr)") ~ "Live",
+        stratum %in% c("Dead (prev)", "Dead (curr)") ~ "Dead",
+        stratum == "Growth"                          ~ "Structural growth",
+        stratum == "Ingrowth"                        ~ "Recruitment",
+        stratum == "Dead losses"                     ~ "Dead losses",
+        TRUE ~ NA_character_
+      )
+    )
+
+  # ---- pool totals for labels ----
+  prev_total <- sum(live_prev, dead_prev)
+  curr_total <- sum(live_curr, dead_curr)
+
+  pool_vals_external <- tibble::tibble(
+    stratum = c("Live (prev)","Dead (prev)",
+                "Live (curr)","Dead (curr)"),
+    x_num   = c(1 - 0.06, 1 - 0.06, 2 + 0.06, 2 + 0.06),
+    y       = c(prev_total * (1 - pool_top_margin_frac),
+                prev_total * pool_bottom_margin_frac,
+                curr_total * (1 - pool_top_margin_frac),
+                curr_total * pool_bottom_margin_frac),
+    hjust   = c(1, 1, 0, 0),
+    label   = c(
+      paste0(fmt(live_prev), " ", units_suffix),
+      paste0(fmt(dead_prev), " ", units_suffix),
+      paste0(fmt(live_curr), " ", units_suffix),
+      paste0(fmt(dead_curr), " ", units_suffix)
+    )
+  )
+
+  # ---- flow labels ----
+  total_in_curr <- sum(flows$value)
+  lbl_thresh <- max(label_min_frac * total_in_curr, label_min_value)
+
+  labels_df <- flows %>%
+    dplyr::filter(value >= lbl_thresh) %>%
+    dplyr::group_by(to) %>%
+    dplyr::mutate(
+      cum = cumsum(value),
+      y_lab = cum - value / 2
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(label = paste0(flux, ": ", fmt(value)))
+
+  # ---- palettes ----
+  pal_flows <- c(
+  "Survivors"      = scales::alpha(col_live, 0.30),
+  "Growth"         = scales::alpha(col_live, 1),
+  "Ingrowth"       = scales::alpha(col_live, 0.75),
+  "Mortality"      = scales::alpha(col_dead, 1),
+  "Dead retention" = scales::alpha(col_dead, 0.35),
+  "Dead losses"    = scales::alpha("#cfcfcf", 0.80)
+)
+
+
+  if (!is.null(palette_overrides)) {
+    pal_flows[names(palette_overrides)] <- palette_overrides
+  }
+
+  pal_pools <- c(
+    "Live"              = col_live,
+    "Dead"              = col_dead,
+    "Structural growth" = col_growth_pool,
+    "Recruitment"       = col_recruit_pool,
+    "Dead losses"       = "#d9d9d9"
+  )
+
+  right_x_num <- 2 + right_label_xshift
+
+  # ---- plot ----
+  
+p <- ggplot(
+  long,
+  aes(x = x, stratum = stratum, alluvium = flow_id,
+      y = value, fill = flux, order = order_idx)
+) +
+  geom_alluvium(
+    width = flow_width,
+    colour = "white",
+    size = flow_outline_size,
+    curve_type = "cubic"
+  ) +
+  scale_fill_manual(
+    values = pal_flows,
+    name   = "Flux",
+    guide  = guide_legend(ncol = 1, direction = "vertical")
+  ) +
+  ggnewscale::new_scale_fill() +
+  geom_stratum(
+    aes(fill = pool_grp),
+    width = bar_width,
+    colour = "grey30",
+    alpha = bar_alpha
+  ) +
+  scale_fill_manual(
+    values = pal_pools,
+    name   = "Pool",
+    guide  = guide_legend(
+      order = 1,
+      nrow = 1,
+      override.aes = list(alpha = 1)
+    )
+  )
+
+# ---- add pool labels conditionally ----
+if (pool_label_size > 0) {
+  p <- p +
+    geom_text(
+      data = pool_vals_external, inherit.aes = FALSE,
+      aes(x = x_num, y = y, label = label, hjust = hjust),
+      size = pool_label_size, fontface = "bold"
+    )
+}
+
+# ---- add flow labels (size 0 is fine) ----
+p <- p +
+  geom_text(
+    data = labels_df, inherit.aes = FALSE,
+    aes(x = right_x_num, y = y_lab, label = label),
+    hjust = 0, size = flow_label_size
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  coord_cartesian(clip = "off") +
+  labs(
+    title    = paste0("Biomass Flux Sankey — ", row$pltID),
+    subtitle = paste0(
+      row$MEASYEAR_prev, " → ", row$MEASYEAR,
+      if (use_Mg) paste0(" (", units_suffix, ")") else ""
+    ),
+    x = NULL, y = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.box.just = "center",
+    legend.justification = "center",
+    legend.spacing.y = unit(4, "pt"),
+    legend.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold"),
+    plot.margin = margin(t = 8, r = 120, b = 10, l = 70)
+  )
+
+return(p)
+
+}
+```
+
+## Creating DF
+
+```{r}
+# Aggregate to two groups - disturbed and non-disturbed
+pools_for_sankey <- pools_both %>%
+  left_join(disturbance_interval, by = c("PLT_CN", "MEASYEAR")) %>%
+  mutate(disturbed = if_else(is.na(disturbed), FALSE, disturbed)) %>%
+  filter(!B1_live_ag == 0 & !B2_live_ag == 0) #Breaks biomass balance
+
+# Define columns for Sankey diagram
+sankey_cols <- c(
+  "B1_live_ag","B1_dead_ag",
+  "B2_live_ag","B2_dead_ag",
+  "grow_in_ag","ingrowth_in_ag","Mort_in_ag"
+)
+
+# Non-Disturbed Plots
+pools_nondist <- pools_for_sankey %>%
+  filter(!disturbed) %>%
+  summarise(
+    across(all_of(sankey_cols), sum, na.rm = TRUE),
+    n_plots = n()
+  ) %>%
+  mutate(
+    pltID = "All plots",
+    MEASYEAR_prev = min(pools_for_sankey$MEASYEAR_prev),
+    MEASYEAR      = max(pools_for_sankey$MEASYEAR)
+  )
+
+# Disturbed Plots
+pools_dist <- pools_for_sankey %>%
+  filter(disturbed) %>%
+  summarise(
+    across(all_of(sankey_cols), sum, na.rm = TRUE),
+    n_plots = n()
+  ) %>%
+  mutate(
+    pltID = "All plots",
+    MEASYEAR_prev = min(pools_for_sankey$MEASYEAR_prev),
+    MEASYEAR      = max(pools_for_sankey$MEASYEAR)
+  )
+```
+
+## Create Plot Panels
+
+```{r}
+# Non-Disturbed
+p_nondist <- plot_flux_sankey_alluvial_clean(
+  pools_nondist,
+  show_legend       = TRUE,
+  pool_label_size   = 2.25,
+  pool_top_margin_frac    = 0.01,
+  pool_bottom_margin_frac = 0.22,
+  flow_label_size   = 0,
+  label_min_frac    = 1,
+  label_min_value   = Inf,
+  bar_width         = 0.10,
+  flow_width        = 0.10
+) +
+  labs(title = "Non-disturbed plots (n = 394)") +
+  scale_x_discrete(expand = expansion(add = c(0.15, 0.15))) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = margin(6, 20, 6, 20)
+  )
+
+# Disturbed
+p_dist <- plot_flux_sankey_alluvial_clean(
+  pools_dist,
+  show_legend       = FALSE,
+  pool_label_size   = 2.25,
+  pool_top_margin_frac    = 0,
+  pool_bottom_margin_frac = 0.14,
+  flow_label_size   = 0,
+  label_min_frac    = 1,
+  label_min_value   = Inf,
+  bar_width         = 0.10,
+  flow_width        = 0.10
+) +
+  labs(title = "Disturbed plots (n = 101)") +
+  scale_x_discrete(expand = expansion(add = c(0.15, 0.15))) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.margin = margin(6, 20, 6, 20)
+  )
+```
+
+## Combine Panels
+
+```{r}
+(p_nondist | p_dist) +
+  plot_annotation(
+    subtitle = "Remeasured, forested FIA plots. 'Disturbed plots' indicates some disturbance occurring sometime in between sampling points.",
+    theme = theme(
+      plot.subtitle = element_text(hjust = 0.25, size = 8.5),
+      plot.margin = margin(t = 10, r = 40, b = 10, l = 10),
+      panel.spacing = unit(0.5, "lines")
+    )
+  ) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text  = element_text(size = 8),
+    legend.key.size = unit(0.7, "lines")
+  )
+```
+
+# Figure 8 - Sankey Diagrams by Disturbance Type
+
+## Creating DF
+
+```{r}
+# Work at the plot–interval level (NOT one row per plot)
+pools_disturbed <- pools_both %>%
+  left_join(
+    disturbance_interval %>% select(PLT_CN, MEASYEAR, disturbed),
+    by = c("PLT_CN", "MEASYEAR")
+  ) %>%
+  filter(disturbed)
+
+# Attach disturbance agent (same logic as QMD figures)
+# N = 95, 6 plots are unidentifiable in their cause of disturbance
+pools_disturbed <- pools_disturbed %>%
+  left_join(
+    qmd_disturb_type %>% select(PLT_CN, DSTRBCD1, disturb_type),
+    by = "PLT_CN"
+  ) %>%
+  mutate(
+    disturb_type = case_when(
+      is.na(disturb_type) ~ "Other",
+      TRUE                ~ disturb_type
+    )
+  ) %>%
+  filter(!is.na(DSTRBCD1))
+
+# Ensure one row per biomass balance
+pools_disturbed_unique <- pools_disturbed %>%
+  distinct(
+    PLT_CN,
+    MEASYEAR_prev,
+    MEASYEAR,
+    .keep_all = TRUE
+  )
+
+# Aggregate by Disturbance Type
+pools_by_disturbance <- pools_disturbed_unique %>%
+  group_by(disturb_type) %>%
+  summarise(
+    across(all_of(sankey_cols), sum, na.rm = TRUE),
+    MEASYEAR_prev = min(MEASYEAR_prev),
+    MEASYEAR      = max(MEASYEAR),
+    n_plots = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    pltID = paste0(disturb_type, " (n = ", n_plots, ")")
+  )
+```
+
+## Build Plot Components
+
+```{r}
+# -----------------------------
+# 1) Build 4 panel plots (NO legend)
+# -----------------------------
+disturbance_sankeys <- pools_by_disturbance %>%
+  split(.$disturb_type) %>%
+  purrr::map(~ plot_flux_sankey_alluvial_clean(
+    .x,
+    use_Mg = TRUE,
+    units_suffix = "Mg/ac",
+    show_legend       = FALSE,  # panels: no legend
+    pool_label_size   = 0,
+    flow_label_size   = 0,
+    label_min_frac    = 1,
+    label_min_value   = Inf,
+    pool_top_margin_frac    = 0.02,
+    pool_bottom_margin_frac = 0.02,
+    bar_width         = 0.12,
+    flow_width        = 0.12,
+    flow_outline_size = 0.6
+  ))
+
+wildfire_g <- disturbance_sankeys$Fire
+insects_g  <- disturbance_sankeys$Insects
+disease_g  <- disturbance_sankeys$Disease
+other_g    <- disturbance_sankeys$Other
+
+# Keep the spacing you like
+strip_for_panel <- function(p) {
+  p +
+    theme(
+      legend.position = "none",
+      plot.title = element_blank(),
+      plot.subtitle = element_blank(),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      plot.margin = margin(2, 2, 2, 2)
+    )
+}
+
+wildfire_g <- strip_for_panel(wildfire_g)
+insects_g  <- strip_for_panel(insects_g)
+disease_g  <- strip_for_panel(disease_g)
+other_g    <- strip_for_panel(other_g)
+
+# -----------------------------
+# 2) Create a legend donor plot (legend ON)
+#    Force BOTH Pool and Flux legend entries to stack vertically
+# -----------------------------
+legend_g <- plot_flux_sankey_alluvial_clean(
+  pools_by_disturbance,        # full data helps ensure all legend entries exist
+  use_Mg = TRUE,
+  units_suffix = "Mg/ac",
+  show_legend       = TRUE,    # donor legend ON
+  pool_label_size   = 0,
+  flow_label_size   = 0,
+  label_min_frac    = 1,
+  label_min_value   = Inf,
+  pool_top_margin_frac    = 0.02,
+  pool_bottom_margin_frac = 0.02,
+  bar_width         = 0.12,
+  flow_width        = 0.12,
+  flow_outline_size = 0.6
+) +
+  theme(
+    legend.position  = "right",
+
+    # Stack legend blocks top-to-bottom
+    legend.box       = "vertical",
+    legend.box.just  = "left",
+
+    # Force items inside each block to be vertical too
+    legend.direction = "vertical",
+
+    # Typography
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text  = element_text(size = 8),
+
+    # Keys + spacing (keeps it legible while using vertical space)
+    legend.key.size   = unit(0.40, "cm"),
+    legend.key.height = unit(0.45, "cm"),
+    legend.key.width  = unit(0.40, "cm"),
+    legend.spacing.y  = unit(0.14, "cm"),
+    legend.spacing.x  = unit(0.10, "cm"),
+
+    legend.margin     = margin(0, 0, 0, 0),
+    legend.box.margin = margin(0, 0, 0, 0),
+    plot.margin       = margin(0, 0, 0, 0)
+  ) +
+  guides(
+    # Aggressive override: whichever aesthetic Flux uses,
+    # force its guide to be vertical & 1-column.
+    fill   = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 1),
+    colour = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 2),
+    color  = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 2),
+    alpha  = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 3),
+    linetype = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 4),
+    shape  = guide_legend(ncol = 1, byrow = TRUE, direction = "vertical", order = 5)
+  )
+
+# Extract legend and wrap so it CLIPS and doesn't overlap panels
+leg <- get_legend(legend_g)
+leg <- as_ggplot(leg)
+
+# -----------------------------
+# 3) Panel labels
+# -----------------------------
+panel_labels <- pools_by_disturbance %>%
+  mutate(label = paste0(disturb_type, " (n = ", n_plots, ")")) %>%
+  select(disturb_type, label) %>%
+  tibble::deframe()
+
+# -----------------------------
+# 4) Arrange panels (2x2) + legend column on the right
+# -----------------------------
+grid_panels <- ggarrange(
+  wildfire_g, insects_g, disease_g, other_g,
+  ncol = 2, nrow = 2,
+  labels = c(
+    paste0("A – ", panel_labels["Fire"]),
+    paste0("B – ", panel_labels["Insects"]),
+    paste0("C – ", panel_labels["Disease"]),
+    paste0("D – ", panel_labels["Other"])
+  ),
+  font.label = list(size = 11, face = "bold"),
+  label.x = 0.02,
+  label.y = 1.01,
+  align = "hv"
+)
+
+# Keep the spacing you like
+fig_8 <- ggarrange(
+  grid_panels, leg,
+  ncol = 2,
+  widths = c(1, 0.32)
+)
+
+# -----------------------------
+# 5) Add title and caption
+# -----------------------------
+fig_8_final <- annotate_figure(
+  fig_8,
+  top = text_grob(
+    "Biomass Flux Pathways by Disturbance Type",
+    #face = "bold",
+    size = 14,
+    vjust = 0.50
+  ),
+  bottom = text_grob(
+    "Per-plot mean biomass fluxes (Mg/ac)",
+    size = 9
+  )
+)
+
+fig_8_final
+```
+
+# Figure 9 - Live Biomass Shifts by Forest Type
+
+## Creating DF
+
+```{r}
+# Establishing condition requirements
+cond_ft <- db$COND %>%
+  filter(COND_STATUS_CD == 1, CONDPROP_UNADJ > 0) %>%
+  select(PLT_CN, CONDPROP_UNADJ, FORTYPCD) %>%
+  group_by(PLT_CN) %>%
+  slice_max(CONDPROP_UNADJ, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Eligible Plots
+eligible_plots <- pools_both %>%
+  group_by(PLT_CN) %>%
+  summarise(
+    B1_total = sum(B1_live_ag, na.rm = TRUE),
+    B2_total = sum(B2_live_ag, na.rm = TRUE)
+  ) %>%
+  filter(B1_total > 0 & B2_total > 0) %>%
+  pull(PLT_CN)
+
+# Aggregate by Plot
+pools_sum <- pools_both %>%
+  filter(PLT_CN %in% eligible_plots) %>%
+  left_join(cond_ft, by = "PLT_CN") %>%
+  group_by(FORTYPCD) %>%
+  summarise(
+    B1_live_ag = sum(B1_live_ag, na.rm = TRUE),
+    B2_live_ag = sum(B2_live_ag, na.rm = TRUE),
+    n_plots = n_distinct(PLT_CN),
+    .groups = "drop"
+  ) %>%
+  left_join(ft_label_legend, by = "FORTYPCD")
+
+# Convert to share of live biomass
+total_live_t1 <- sum(pools_sum$B1_live_ag, na.rm = TRUE)
+total_live_t2 <- sum(pools_sum$B2_live_ag, na.rm = TRUE)
+
+# Calculating proportions of total biomass
+comp_statewide <- pools_sum %>%
+  mutate(
+    share_t1 = B1_live_ag / total_live_t1,
+    share_t2 = B2_live_ag / total_live_t2
+  ) %>%
+  select(ft_label, share_t1, share_t2, n_plots)
+
+# Convert to long-format for plotting
+comp_long <- comp_statewide %>%
+  pivot_longer(
+    cols = c(share_t1, share_t2),
+    names_to = "time",
+    values_to = "share"
+  ) %>%
+  mutate(
+    time = recode(
+      time,
+      share_t1 = "Time 1",
+      share_t2 = "Time 2"
+    )
+  )
+```
+
+## Plot
+
+```{r}
+ggplot(
+  comp_long,
+  aes(
+    y = reorder(ft_label, share, FUN = mean),
+    x = share,
+    fill = time
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_x_continuous(
+    trans = scales::pseudo_log_trans(sigma = 0.001),
+    labels = scales::percent_format(accuracy = 0.1),
+    breaks = c(0.001, 0.005, 0.01, 0.03, 0.1, 0.3)
+  ) +
+  labs(
+    title = "Live biomass composition shifts by forest type",
+    x = "Share of total live biomass (pseudo-log scale)",
+    y = NULL,
+    fill = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "grey85"),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+```
+
